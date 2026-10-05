@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -10,6 +11,7 @@ import os
 
 # ========== НАСТРОЙКИ ==========
 TOKEN = os.getenv("BOT_TOKEN", "СЮДА_ВСТАВЬ_ТОКЕН_ОТ_BOTFATHER")
+MIN_PREDICTIONS = 3          # показывать только матчи, где ≥ N прогнозов
 # ===============================
 
 bot = Bot(
@@ -20,11 +22,16 @@ dp = Dispatcher(storage=MemoryStorage())
 
 BASE_API = "https://stavka.tv/api/v2"
 
+MONTHS_RU = {
+    1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май", 6: "июн",
+    7: "июл", 8: "авг", 9: "сен", 10: "окт", 11: "ноя", 12: "дек"
+}
+
 
 async def fetch_json(url: str, params: dict = None) -> dict | None:
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 return None
@@ -33,8 +40,7 @@ async def fetch_json(url: str, params: dict = None) -> dict | None:
         return None
 
 
-async def get_matches(sport: str, limit: int = 20) -> list:
-    """sport: 'dota2' или 'csgo'"""
+async def get_matches(sport: str, limit: int = 30) -> list:
     data = await fetch_json(f"{BASE_API}/matches", {
         "sport": sport,
         "status": "upcoming",
@@ -53,20 +59,36 @@ async def get_popular_bets(slug: str) -> dict | None:
     return await fetch_json(f"{BASE_API}/matches/{slug}/popular-bets")
 
 
-def format_percent_bar(percent: int, width: int = 10) -> str:
-    """Простой текстовый прогресс-бар"""
+def format_date(iso_date: str) -> str:
+    """Превращает 2026-10-05T14:00:00+00:00 → 05 окт 14:00"""
+    try:
+        dt = datetime.fromisoformat(iso_date.replace("Z", "+00:00"))
+        # Переводим в МСК (UTC+3)
+        dt = dt + timedelta(hours=3)
+        day = dt.day
+        month = MONTHS_RU.get(dt.month, str(dt.month))
+        time_str = dt.strftime("%H:%M")
+        return f"{day:02d} {month} {time_str}"
+    except Exception:
+        return iso_date[11:16] if len(iso_date) > 16 else iso_date
+
+
+def progress_bar(percent: int, width: int = 12) -> str:
+    """Красивый прогресс-бар"""
     filled = round(percent / 100 * width)
-    return "█" * filled + "░" * (width - filled)
+    return "▓" * filled + "░" * (width - filled)
 
 
-def format_user_opinion(aggregated: dict | None, popular: dict | None, match_name: str) -> str:
-    """Форматирует пользовательское мнение как на скрине stavka.tv"""
-    lines = [f"<b>📊 Пользовательское мнение</b>\n<b>{match_name}</b>\n"]
+def format_user_opinion(aggregated: dict | None, popular: dict | None, home: str, away: str, date_str: str) -> str:
+    lines = [
+        f"<b>📊 Пользовательское мнение</b>",
+        f"<b>{home} — {away}</b>",
+        f"📅 {date_str}",
+        ""
+    ]
 
-    if not aggregated and not popular:
-        return lines[0] + "\nПока нет прогнозов от пользователей."
+    total_predictions = 0
 
-    # === Используем aggregated (как на скрине) ===
     if aggregated and "data" in aggregated:
         all_groups = aggregated["data"].get("all") or aggregated["data"].get("capper") or []
 
@@ -76,8 +98,10 @@ def format_user_opinion(aggregated: dict | None, popular: dict | None, match_nam
             if bets_count == 0:
                 continue
 
+            total_predictions = max(total_predictions, bets_count)
+
             if group_name == "one_two":
-                lines.append(f"<b>Победитель матча</b> · {bets_count} прогнозов")
+                lines.append(f"<b>🏆 Победитель матча</b> · {bets_count} прогнозов")
                 uni = group.get("univariate") or []
                 total = sum(item.get("count", 0) for item in uni) or 1
                 for item in uni:
@@ -85,12 +109,12 @@ def format_user_opinion(aggregated: dict | None, popular: dict | None, match_nam
                     count = item.get("count", 0)
                     pct = round(count / total * 100) if total else 0
                     name = "П1" if outcome == "w1" else "П2"
-                    bar = format_percent_bar(pct)
-                    lines.append(f"  {name}  {bar}  <b>{pct}%</b> ({count})")
+                    bar = progress_bar(pct)
+                    lines.append(f"<code>{name}</code>  {bar}  <b>{pct}%</b> ({count})")
                 lines.append("")
 
             elif group_name == "total":
-                lines.append(f"<b>Тотал</b> · {bets_count} прогнозов")
+                lines.append(f"<b>📈 Тотал</b> · {bets_count} прогнозов")
                 bivariate = group.get("bivariate") or []
                 for pair in bivariate:
                     for item in pair:
@@ -99,12 +123,12 @@ def format_user_opinion(aggregated: dict | None, popular: dict | None, match_nam
                         count = item.get("count", 0)
                         pct = round(count / bets_count * 100) if bets_count else 0
                         name = "ТМ" if "under" in t else "ТБ"
-                        bar = format_percent_bar(pct)
-                        lines.append(f"  {name} ({out})  {bar}  <b>{pct}%</b> ({count})")
+                        bar = progress_bar(pct)
+                        lines.append(f"<code>{name} ({out})</code>  {bar}  <b>{pct}%</b> ({count})")
                 lines.append("")
 
             elif group_name == "handicap":
-                lines.append(f"<b>Форы</b> · {bets_count} прогнозов")
+                lines.append(f"<b>⚖️ Форы</b> · {bets_count} прогнозов")
                 bivariate = group.get("bivariate") or []
                 for pair in bivariate:
                     for item in pair:
@@ -113,47 +137,56 @@ def format_user_opinion(aggregated: dict | None, popular: dict | None, match_nam
                         count = item.get("count", 0)
                         pct = round(count / bets_count * 100) if bets_count else 0
                         name = "Ф1" if "handicap1" in t else "Ф2"
-                        bar = format_percent_bar(pct)
-                        lines.append(f"  {name} ({out})  {bar}  <b>{pct}%</b> ({count})")
+                        bar = progress_bar(pct)
+                        lines.append(f"<code>{name} ({out})</code>  {bar}  <b>{pct}%</b> ({count})")
                 lines.append("")
 
             elif group_name == "correct_score":
-                lines.append(f"<b>Точный счёт</b> · {bets_count} прогнозов")
+                lines.append(f"<b>🎯 Точный счёт</b> · {bets_count} прогнозов")
                 uni = group.get("univariate") or []
                 total = sum(item.get("count", 0) for item in uni) or 1
-                # Берём топ-4
-                sorted_uni = sorted(uni, key=lambda x: x.get("count", 0), reverse=True)[:4]
+                sorted_uni = sorted(uni, key=lambda x: x.get("count", 0), reverse=True)[:5]
                 for item in sorted_uni:
                     out = item.get("outcome", "")
                     count = item.get("count", 0)
                     pct = round(count / total * 100) if total else 0
-                    bar = format_percent_bar(pct)
-                    lines.append(f"  {out}  {bar}  <b>{pct}%</b> ({count})")
+                    bar = progress_bar(pct)
+                    lines.append(f"<code>{out}</code>  {bar}  <b>{pct}%</b> ({count})")
                 lines.append("")
 
-    # Если aggregated пустой — fallback на popular
-    if len(lines) <= 2 and popular and "data" in popular:
-        lines.append("<b>Популярные исходы</b>")
-        for item in popular.get("data", [])[:8]:
-            t = item.get("type", "")
-            out = str(item.get("outcome", "")).replace("_", ".")
-            pct = item.get("percent", 0)
-            count = item.get("count", 0)
-            name = {
-                "one_two": "П1" if out == "w1" else "П2",
-                "total_under": f"ТМ ({out})",
-                "total_over": f"ТБ ({out})",
-                "handicap1": f"Ф1 ({out})",
-                "handicap2": f"Ф2 ({out})",
-                "correct_score": f"Счёт {out}",
-            }.get(t, f"{t} {out}")
-            bar = format_percent_bar(int(pct))
-            lines.append(f"  {name}  {bar}  <b>{pct}%</b> ({count})")
+    # Fallback на popular-bets
+    if total_predictions < MIN_PREDICTIONS and popular and "data" in popular:
+        meta_total = popular.get("meta", {}).get("total", 0)
+        if meta_total >= MIN_PREDICTIONS:
+            lines.append(f"<b>🔥 Популярные исходы</b> · {meta_total} прогнозов")
+            for item in popular.get("data", [])[:8]:
+                t = item.get("type", "")
+                out = str(item.get("outcome", "")).replace("_", ".")
+                pct = int(item.get("percent", 0))
+                count = item.get("count", 0)
+                name_map = {
+                    "one_two": "П1" if out == "w1" else "П2",
+                    "total_under": f"ТМ ({out})",
+                    "total_over": f"ТБ ({out})",
+                    "handicap1": f"Ф1 ({out})",
+                    "handicap2": f"Ф2 ({out})",
+                    "correct_score": f"Счёт {out}",
+                }
+                name = name_map.get(t, f"{t} {out}")
+                bar = progress_bar(pct)
+                lines.append(f"<code>{name}</code>  {bar}  <b>{pct}%</b> ({count})")
+            total_predictions = meta_total
 
-    if len(lines) <= 2:
-        return lines[0] + "\nПока мало прогнозов от пользователей."
+    if total_predictions < MIN_PREDICTIONS:
+        return (
+            f"<b>📊 Пользовательское мнение</b>\n"
+            f"<b>{home} — {away}</b>\n"
+            f"📅 {date_str}\n\n"
+            f"Пока слишком мало прогнозов ({total_predictions}).\n"
+            f"Попробуй позже или выбери другой матч."
+        )
 
-    return "\n".join(lines)
+    return "\n".join(lines).strip()
 
 
 @dp.message(CommandStart())
@@ -167,9 +200,9 @@ async def cmd_start(message: types.Message):
     ])
     await message.answer(
         "<b>Привет!</b> 👋\n\n"
-        "Я показываю <b>пользовательское мнение</b> по матчам Dota 2 и Counter-Strike 2 "
-        "в реальном времени — что люди выбирают чаще всего (в процентах).\n\n"
-        "Данные берутся со stavka.tv\n\n"
+        "Я показываю <b>пользовательское мнение</b> по матчам "
+        "<b>Dota 2</b> и <b>CS2</b> в реальном времени.\n\n"
+        "Что выбирают люди чаще всего — в процентах.\n\n"
         "Выбери дисциплину:",
         reply_markup=kb
     )
@@ -180,28 +213,29 @@ async def cmd_start(message: types.Message):
 async def cmd_help(event: types.Message | CallbackQuery):
     text = (
         "<b>Как работает бот</b>\n\n"
-        "1. Выбираешь Dota 2 или CS2\n"
-        "2. Видишь список ближайших матчей\n"
-        "3. Нажимаешь на матч — получаешь проценты по:\n"
-        "   • Победителю матча (П1/П2)\n"
-        "   • Тоталу (ТМ/ТБ)\n"
-        "   • Форам\n"
-        "   • Точному счёту\n\n"
-        "Проценты считаются по реальным прогнозам пользователей stavka.tv.\n"
-        "Чем больше прогнозов — тем точнее картинка."
+        "• Выбираешь Dota 2 или CS2\n"
+        "• Видишь список ближайших матчей <b>с датой и временем</b>\n"
+        "• Нажимаешь на матч → получаешь проценты по:\n"
+        "   🏆 Победителю\n"
+        "   📈 Тоталу\n"
+        "   ⚖️ Форам\n"
+        "   🎯 Точному счёту\n\n"
+        f"Показываются только матчи, где уже есть ≥ {MIN_PREDICTIONS} прогнозов.\n"
+        "Данные обновляются в реальном времени со stavka.tv."
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="« Назад", callback_data="back_start")]
+    ])
     if isinstance(event, CallbackQuery):
-        await event.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="« Назад", callback_data="back_start")]
-        ]))
+        await event.message.edit_text(text, reply_markup=kb)
         await event.answer()
     else:
-        await event.answer(text)
+        await event.answer(text, reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("sport_"))
 async def on_sport_chosen(callback: CallbackQuery):
-    sport = callback.data.split("_", 1)[1]  # dota2 / csgo
+    sport = callback.data.split("_", 1)[1]
     sport_name = "Dota 2" if sport == "dota2" else "CS2"
 
     await callback.message.edit_text(f"⏳ Загружаю матчи {sport_name}...")
@@ -213,7 +247,7 @@ async def on_sport_chosen(callback: CallbackQuery):
             [InlineKeyboardButton(text="« Назад", callback_data="back_start")]
         ])
         await callback.message.edit_text(
-            f"Сейчас нет ближайших матчей по {sport_name}.\nПопробуй позже.",
+            f"Сейчас нет ближайших матчей по {sport_name}.",
             reply_markup=kb
         )
         await callback.answer()
@@ -223,28 +257,35 @@ async def on_sport_chosen(callback: CallbackQuery):
     for m in matches:
         home = m["teams"]["home"].get("shortName") or m["teams"]["home"]["name"]
         away = m["teams"]["away"].get("shortName") or m["teams"]["away"]["name"]
-        # Время в МСК примерно
-        match_date = m.get("matchDate", "")
-        time_str = match_date[11:16] if len(match_date) > 16 else "?"
+        date_str = format_date(m.get("matchDate", ""))
         slug = m["slug"]
-        text_btn = f"{home} – {away}  ·  {time_str}"
-        buttons.append([InlineKeyboardButton(text=text_btn, callback_data=f"m_{slug}")])
 
-    buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sport_{sport}")])
+        text_btn = f"{home} — {away}  ·  {date_str}"
+        buttons.append([InlineKeyboardButton(
+            text=text_btn,
+            callback_data=f"m|{slug}|{home}|{away}|{date_str}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"sport_{sport}")])
     buttons.append([InlineKeyboardButton(text="« Назад", callback_data="back_start")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(
-        f"<b>{sport_name}</b> — ближайшие матчи:\n"
-        f"<i>Нажми на матч, чтобы увидеть пользовательское мнение</i>",
+        f"<b>{sport_name}</b> — ближайшие матчи\n"
+        f"<i>Нажми на матч, чтобы увидеть мнение людей</i>",
         reply_markup=kb
     )
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("m_"))
+@dp.callback_query(F.data.startswith("m|"))
 async def on_match_chosen(callback: CallbackQuery):
-    slug = callback.data[2:]  # убираем "m_"
+    parts = callback.data.split("|")
+    if len(parts) < 5:
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+
+    _, slug, home, away, date_str = parts[0], parts[1], parts[2], parts[3], parts[4]
 
     await callback.message.edit_text("⏳ Загружаю пользовательское мнение...")
 
@@ -253,20 +294,11 @@ async def on_match_chosen(callback: CallbackQuery):
         get_popular_bets(slug)
     )
 
-    # Достаём названия команд из popular или делаем заглушку
-    match_name = slug.replace("-", " ").title()
-    # Попробуем красивее
-    if aggregated or popular:
-        # slug обычно: 05-10-2026-team1-team2
-        parts = slug.split("-")
-        if len(parts) >= 5:
-            match_name = " – ".join(parts[3:]).replace("-", " ").title()
-
-    text = format_user_opinion(aggregated, popular, match_name)
-    text += f"\n\n🔗 <a href='https://stavka.tv/matches/{slug}'>Открыть матч на stavka.tv</a>"
+    text = format_user_opinion(aggregated, popular, home, away, date_str)
+    text += f"\n\n🔗 <a href='https://stavka.tv/matches/{slug}'>Открыть на stavka.tv</a>"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"m_{slug}")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=callback.data)],
         [InlineKeyboardButton(text="« К списку матчей", callback_data="back_start")],
     ])
 
